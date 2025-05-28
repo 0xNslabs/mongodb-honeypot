@@ -49,7 +49,7 @@ Detailed JSON-formatted logs are written to  `mongodb_honeypot.log`, including:
 
 ## Simple MongoDB Honeypot In Action
 
-![MongoDB Honeypot Detection Example](https://raw.githubusercontent.com/0xNslabs/mongodb-honeypot/main/PoC.png)  
+![MongoDB Honeypot Detection Example](https://raw.githubusercontent.com/0xNslabs/mongodb-honeypot/refs/heads/master/PoC.png)  
 _Example of the honeypot capturing authentication attempts and client fingerprinting_
 
 ## Other Simple Honeypot Services
