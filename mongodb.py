@@ -5,8 +5,10 @@ import datetime
 from twisted.internet import reactor, protocol
 from twisted.python import log
 from bson import BSON
+from bson.binary import Binary
 
 script_dir = os.path.dirname(os.path.abspath(__file__))
+
 
 class SimpleMongoDBProtocol(protocol.Protocol):
     def __init__(self, version=None):
@@ -14,7 +16,9 @@ class SimpleMongoDBProtocol(protocol.Protocol):
         self.client_ip = None
         self.client_port = None
         self.request_id = 0
+        self.server_request_id = 0
         self.max_bson_size = 16 * 1024 * 1024
+        self.max_message_size = 64 * 1024 * 1024
         self.version = version
 
     def connectionMade(self):
@@ -25,130 +29,223 @@ class SimpleMongoDBProtocol(protocol.Protocol):
 
     def dataReceived(self, data):
         self.buffer += data
+        if len(self.buffer) > self.max_message_size * 2:
+            self.transport.loseConnection()
+            return
+
         while True:
             if len(self.buffer) < 16:
                 break
-            length, request_id, response_to, op_code = struct.unpack(
-                "<iiii", self.buffer[:16]
-            )
+
+            try:
+                length, request_id, response_to, op_code = struct.unpack("<iiii", self.buffer[:16])
+            except Exception:
+                self.transport.loseConnection()
+                return
+
+            if length < 16 or length > self.max_message_size:
+                self.transport.loseConnection()
+                return
+
             if length > len(self.buffer):
                 break
 
             full_msg = self.buffer[:length]
             self.buffer = self.buffer[length:]
 
-            self.handleMessage(full_msg, request_id, op_code)
+            self._log_raw_message(full_msg, request_id, response_to, op_code)
+
+            try:
+                self.handleMessage(full_msg, request_id, op_code)
+            except Exception as e:
+                log.msg(f"Error handling message: {str(e)}")
+                self.transport.loseConnection()
+                return
+
+    def _next_server_request_id(self):
+        self.server_request_id = (self.server_request_id + 1) & 0x7fffffff
+        if self.server_request_id == 0:
+            self.server_request_id = 1
+        return self.server_request_id
+
+    def _log_raw_message(self, full_msg, request_id, response_to, op_code):
+        try:
+            max_dump = 4096
+            chunk = full_msg[:max_dump]
+            hex_data = chunk.hex()
+            suffix = "" if len(full_msg) <= max_dump else f"...(truncated,{len(full_msg)}B)"
+            log.msg(
+                f"[RAW] {self.client_ip}:{self.client_port} op={op_code} request_id={request_id} response_to={response_to} len={len(full_msg)} data={hex_data}{suffix}"
+            )
+        except Exception:
+            pass
 
     def handleMessage(self, full_msg, request_id, op_code):
-        try:
-            if op_code == 2013:
-                self.handle_op_msg(full_msg, request_id)
-            elif op_code == 2004:
-                self.handle_op_query(full_msg, request_id)
-            else:
-                self.transport.loseConnection()
+        if op_code == 2013:
+            self.handle_op_msg(full_msg, request_id)
+            return
+        if op_code == 2004:
+            self.handle_op_query(full_msg, request_id)
+            return
+        self.transport.loseConnection()
 
-        except Exception as e:
-            log.msg(f"Error handling message: {str(e)}")
-            self.transport.loseConnection()
+    def _parse_bson_doc(self, bts, offset=0):
+        if offset + 4 > len(bts):
+            return None, offset
+        dlen = struct.unpack("<i", bts[offset:offset + 4])[0]
+        if dlen < 5 or offset + dlen > len(bts):
+            return None, offset
+        doc = BSON(bts[offset:offset + dlen]).decode()
+        return doc, offset + dlen
 
     def handle_op_msg(self, full_msg, request_id):
         payload = full_msg[16:]
+        if len(payload) < 5:
+            self.send_op_msg_response(request_id, {"ok": 0, "errmsg": "Malformed OP_MSG", "code": 9, "codeName": "FailedToParse"})
+            return
+
         try:
-            flags = struct.unpack("<I", payload[:4])[0]
+            _flags = struct.unpack("<I", payload[:4])[0]
             payload = payload[4:]
 
-            sections = []
+            body_doc = None
+
             while payload:
                 kind = payload[0]
                 payload = payload[1:]
 
                 if kind == 0:
-                    doc, end = BSON(payload).decode(), len(BSON(payload))
-                    sections.append(("body", doc))
-                    payload = payload[end:]
-                elif kind == 1:
-                    size = struct.unpack("<i", payload[:4])[0]
-                    identifier = payload[4 : payload.find(b"\x00")]
-                    docs = []
-                    pos = 4 + len(identifier) + 1
-                    while pos < size:
-                        doc, end = BSON(payload[pos:]).decode(), len(
-                            BSON(payload[pos:])
-                        )
-                        docs.append(doc)
-                        pos += end
-                    sections.append(("sequence", identifier.decode(), docs))
-                    payload = payload[size:]
-                else:
+                    doc, new_off = self._parse_bson_doc(payload, 0)
+                    if isinstance(doc, dict):
+                        body_doc = doc
                     break
 
-            for section in sections:
-                if section[0] == "body":
-                    self.process_op_msg_body(section[1], request_id)
+                if kind == 1:
+                    if len(payload) < 4:
+                        break
+                    size = struct.unpack("<i", payload[:4])[0]
+                    if size < 5 or size > len(payload):
+                        break
+                    block = payload[:size]
+                    payload = payload[size:]
+
+                    nul = block.find(b"\x00", 4)
+                    if nul == -1:
+                        continue
+                    pos = nul + 1
+                    while pos < len(block):
+                        doc, pos2 = self._parse_bson_doc(block, pos)
+                        if doc is None:
+                            break
+                        pos = pos2
+                    continue
+
+                break
+
+            if not isinstance(body_doc, dict):
+                self.send_op_msg_response(
+                    request_id,
+                    {"ok": 0, "errmsg": "Malformed OP_MSG", "code": 9, "codeName": "FailedToParse"},
+                )
+                return
+
+            self.process_op_msg_body(body_doc, request_id)
 
         except Exception as e:
-            response = {
-                "ok": 0,
-                "errmsg": str(e),
-                "code": 13,
-                "codeName": "Unauthorized",
-            }
+            response = {"ok": 0, "errmsg": str(e), "code": 13, "codeName": "Unauthorized"}
             self.send_op_msg_response(request_id, response)
 
     def process_op_msg_body(self, doc, request_id):
         cmd_name = next(iter(doc)) if doc else "unknown"
-        db = doc.get("$db", "")
         self.log_command(doc, cmd_name)
-        if cmd_name == "ismaster":
-            self.send_ismaster_response(request_id)
-        elif cmd_name == "saslStart":
+
+        cmd_lc = str(cmd_name).lower()
+        if cmd_lc in ("ismaster", "hello"):
+            self.send_ismaster_response(request_id, requested_cmd=cmd_lc, is_op_msg=True)
+            return
+        if cmd_lc == "saslstart" or cmd_lc == "saslcontinue":
             self.handle_sasl_start(doc, request_id)
-        elif cmd_name == "ping":
-            self.send_ping_response(request_id)
-        elif cmd_name == "buildInfo":
-            self.send_buildinfo_response(request_id)
-        else:
-            self.send_unauthorized(request_id)
+            return
+        if cmd_lc == "ping":
+            self.send_ping_response(request_id, is_op_msg=True)
+            return
+        if cmd_lc == "buildinfo":
+            self.send_buildinfo_response(request_id, is_op_msg=True)
+            return
+
+        self.send_unauthorized(request_id, is_op_msg=True)
 
     def handle_op_query(self, full_msg, request_id):
         payload = full_msg[16:]
         try:
-            flags = struct.unpack("<i", payload[:4])[0]
+            if len(payload) < 4:
+                self.transport.loseConnection()
+                return
+
+            _flags = struct.unpack("<i", payload[:4])[0]
             payload = payload[4:]
 
-            collection_name, _, payload = payload.partition(b"\x00")
-            collection_name = collection_name.decode()
-            db_name = collection_name.split(".")[0]
+            nul = payload.find(b"\x00")
+            if nul == -1:
+                self.transport.loseConnection()
+                return
 
-            skip = struct.unpack("<i", payload[:4])[0]
-            return_count = struct.unpack("<i", payload[4:8])[0]
-            query = BSON(payload[8:]).decode()
+            collection_name = payload[:nul].decode("utf-8", "replace")
+            payload = payload[nul + 1:]
 
-            cmd_name = next(iter(query)) if query else "unknown"
+            if len(payload) < 8:
+                self.transport.loseConnection()
+                return
 
-            self.log_command(query, cmd_name)
+            _skip, _return_count = struct.unpack("<ii", payload[:8])
+            payload = payload[8:]
 
-            if cmd_name == "ismaster" or cmd_name == "hello":
-                self.send_ismaster_response(request_id)
-            elif cmd_name == "ping":
-                self.send_ping_response(request_id)
-            elif cmd_name == "buildInfo":
-                self.send_buildinfo_response(request_id)
-            else:
-                self.send_unauthorized(request_id)
+            query_doc, off = self._parse_bson_doc(payload, 0)
+            if not isinstance(query_doc, dict):
+                self.send_unauthorized(request_id, is_op_msg=False)
+                return
+
+            if "$query" in query_doc and isinstance(query_doc.get("$query"), dict):
+                base = query_doc.get("$query") or {}
+                extras = {k: v for k, v in query_doc.items() if k != "$query"}
+                merged = dict(base)
+                merged.update(extras)
+                query_doc = merged
+
+            db_name = collection_name.split(".")[0] if "." in collection_name else collection_name
+            if "$db" not in query_doc:
+                query_doc["$db"] = db_name
+
+            cmd_name = next(iter(query_doc)) if query_doc else "unknown"
+            self.log_command(query_doc, cmd_name)
+
+            cmd_lc = str(cmd_name).lower()
+            if cmd_lc in ("ismaster", "hello"):
+                self.send_ismaster_response(request_id, requested_cmd=cmd_lc, is_op_msg=False)
+                return
+            if cmd_lc == "ping":
+                self.send_ping_response(request_id, is_op_msg=False)
+                return
+            if cmd_lc == "buildinfo":
+                self.send_buildinfo_response(request_id, is_op_msg=False)
+                return
+            if cmd_lc == "saslstart" or cmd_lc == "saslcontinue":
+                self.handle_sasl_start(query_doc, request_id)
+                return
+
+            self.send_unauthorized(request_id, is_op_msg=False)
+
         except Exception as e:
             log.msg(f"Error handling OP_QUERY: {str(e)}")
-            self.send_unauthorized(request_id)
+            self.send_unauthorized(request_id, is_op_msg=False)
 
     def log_command(self, doc, cmd_name):
-        client = doc.get("client", {})
-        app_info = client.get("application", {})
-        driver_info = client.get("driver", {})
-        os_info = client.get("os", {})
-        application_name = f"{app_info.get('name', '')} ({app_info.get('platform', '')}) | {driver_info.get('name', '')} {driver_info.get('version', '')}".strip(
-            " |"
-        )
+        client = doc.get("client", {}) if isinstance(doc, dict) else {}
+        app_info = client.get("application", {}) if isinstance(client, dict) else {}
+        driver_info = client.get("driver", {}) if isinstance(client, dict) else {}
+        os_info = client.get("os", {}) if isinstance(client, dict) else {}
+
+        application_name = f"{app_info.get('name', '')} ({app_info.get('platform', '')}) | {driver_info.get('name', '')} {driver_info.get('version', '')}".strip(" |")
         os_str = f"{os_info.get('name', '')} {os_info.get('architecture', '')} {os_info.get('version', '')}".strip()
 
         log_data = {
@@ -156,7 +253,7 @@ class SimpleMongoDBProtocol(protocol.Protocol):
             "client": f"{self.client_ip}:{self.client_port}",
             "application": application_name,
             "os": os_str,
-            "database": doc.get("$db", ""),
+            "database": doc.get("$db", "") if isinstance(doc, dict) else "",
             "command": cmd_name if cmd_name else "unknown",
         }
         log.msg(f"[CMD] {log_data}")
@@ -165,15 +262,14 @@ class SimpleMongoDBProtocol(protocol.Protocol):
         username = ""
         client_nonce = ""
         try:
-            payload = doc.get("payload", b"")
-            if payload:
+            payload = doc.get("payload", b"") if isinstance(doc, dict) else b""
+            if isinstance(payload, Binary):
+                payload = bytes(payload)
+            if isinstance(payload, (bytes, bytearray)) and payload:
                 payload_str = payload.decode("utf-8", "ignore")
-                parts = dict(
-                    p.split("=", 1) for p in payload_str.split(",") if "=" in p
-                )
+                parts = dict(p.split("=", 1) for p in payload_str.split(",") if "=" in p)
                 username = parts.get("n", "")
                 client_nonce = parts.get("r", "")
-
         except Exception as e:
             log.msg(f"Error parsing SASL payload: {str(e)}")
 
@@ -185,11 +281,10 @@ class SimpleMongoDBProtocol(protocol.Protocol):
             "status": "auth_attempt",
         }
         log.msg(f"[AUTH] {log_data}")
-        self.send_auth_failure(request_id)
+        self.send_auth_failure(request_id, is_op_msg=True)
 
     def build_op_reply(self, request_id, response_doc):
         response_payload = BSON.encode(response_doc)
-
         if len(response_payload) > self.max_bson_size:
             response_payload = self.create_error_response("BSON size too large")
 
@@ -205,14 +300,18 @@ class SimpleMongoDBProtocol(protocol.Protocol):
         reply_body += response_payload
 
         total_length = 16 + len(reply_body)
-        header = struct.pack("<iiii", total_length, 0, request_id, 1)
-
+        header = struct.pack("<iiii", total_length, self._next_server_request_id(), request_id, 1)
         return header + reply_body
 
     def create_error_response(self, message):
-        return BSON.encode(
-            {"ok": 0, "errmsg": message, "code": 13, "codeName": "Unauthorized"}
-        )
+        return BSON.encode({"ok": 0, "errmsg": message, "code": 13, "codeName": "Unauthorized"})
+
+    def send_op_reply_response(self, request_id, response_doc):
+        try:
+            reply = self.build_op_reply(request_id, response_doc)
+            self.transport.write(reply)
+        except Exception:
+            pass
 
     def send_op_msg_response(self, request_id, response_doc):
         try:
@@ -226,32 +325,52 @@ class SimpleMongoDBProtocol(protocol.Protocol):
             msg += payload
 
             total_length = 16 + len(msg)
-            header = struct.pack("<iiii", total_length, 0, request_id, 2013)
-
+            header = struct.pack("<iiii", total_length, self._next_server_request_id(), request_id, 2013)
             self.transport.write(header + msg)
         except Exception as e:
             log.msg(f"Error sending OP_MSG response: {str(e)}")
 
-    def send_ismaster_response(self, request_id):
+    def _wire_version_from_version(self):
+        try:
+            major = int(str(self.version or "").split(".", 1)[0])
+        except Exception:
+            major = 5
+        wv_map = {4: 9, 5: 13, 6: 17, 7: 21, 8: 25}
+        return wv_map.get(major, 13)
+
+    def send_ismaster_response(self, request_id, requested_cmd="ismaster", is_op_msg=True):
+        max_wv = self._wire_version_from_version()
         response = {
             "ismaster": True,
-            "maxWireVersion": 13,
+            "isWritablePrimary": True,
             "minWireVersion": 0,
+            "maxWireVersion": max_wv,
             "ok": 1.0,
             "localTime": datetime.datetime.utcnow(),
             "maxBsonObjectSize": self.max_bson_size,
-            "maxMessageSizeBytes": self.max_bson_size,
+            "maxMessageSizeBytes": self.max_message_size,
             "maxWriteBatchSize": 1000,
             "compression": ["none"],
             "saslSupportedMechs": ["SCRAM-SHA-1", "SCRAM-SHA-256"],
+            "logicalSessionTimeoutMinutes": 30,
+            "connectionId": 1,
         }
-        self.send_op_msg_response(request_id, response)
+        if str(requested_cmd).lower() == "hello":
+            response["helloOk"] = True
 
-    def send_ping_response(self, request_id):
+        if is_op_msg:
+            self.send_op_msg_response(request_id, response)
+        else:
+            self.send_op_reply_response(request_id, response)
+
+    def send_ping_response(self, request_id, is_op_msg=True):
         response = {"ok": 1.0, "ping": "pong"}
-        self.send_op_msg_response(request_id, response)
+        if is_op_msg:
+            self.send_op_msg_response(request_id, response)
+        else:
+            self.send_op_reply_response(request_id, response)
 
-    def send_buildinfo_response(self, request_id):
+    def send_buildinfo_response(self, request_id, is_op_msg=True):
         response = {
             "storageEngines": ["devnull", "wiredTiger"],
             "buildEnvironment": {
@@ -281,9 +400,12 @@ class SimpleMongoDBProtocol(protocol.Protocol):
             "bits": 64,
             "gitVersion": "cf29fc744f8ee2ac9245f2845f29c6a706dc375a",
         }
-        self.send_op_msg_response(request_id, response)
+        if is_op_msg:
+            self.send_op_msg_response(request_id, response)
+        else:
+            self.send_op_reply_response(request_id, response)
 
-    def send_auth_failure(self, request_id):
+    def send_auth_failure(self, request_id, is_op_msg=True):
         response = {
             "ok": 0,
             "errmsg": "Authentication failed",
@@ -292,16 +414,17 @@ class SimpleMongoDBProtocol(protocol.Protocol):
             "conversationId": 1,
             "done": True,
         }
-        self.send_op_msg_response(request_id, response)
+        if is_op_msg:
+            self.send_op_msg_response(request_id, response)
+        else:
+            self.send_op_reply_response(request_id, response)
 
-    def send_unauthorized(self, request_id):
-        response = {
-            "ok": 0,
-            "errmsg": "Unauthorized",
-            "code": 13,
-            "codeName": "Unauthorized",
-        }
-        self.send_op_msg_response(request_id, response)
+    def send_unauthorized(self, request_id, is_op_msg=True):
+        response = {"ok": 0, "errmsg": "Unauthorized", "code": 13, "codeName": "Unauthorized"}
+        if is_op_msg:
+            self.send_op_msg_response(request_id, response)
+        else:
+            self.send_op_reply_response(request_id, response)
 
 
 class SimpleMongoFactory(protocol.Factory):
